@@ -1,0 +1,13 @@
+# Foundry
+out/
+cache/
+broadcast/*/31337/
+
+# Node (if you later add a bundler/live-server via npm)
+node_modules/
+
+# Env
+.env
+
+# OS
+.DS_Store

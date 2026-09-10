@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>StreamPay</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <h1>StreamPay</h1>
+
+  <!-- Wallet connection -->
+  <div id="wallet-section">
+    <button id="connect-btn">Connect MetaMask</button>
+    <p id="wallet-info"></p>
+  </div>
+
+  <!-- Status messages (errors, "transaction pending", etc.) -->
+  <p id="status"></p>
+
+  <!-- ADMIN VIEW -->
+  <div id="admin-view" class="view" hidden>
+    <h2>Admin Panel</h2>
+    <p>Accumulated protocol fees: <span id="admin-fee-balance">0</span> ETH</p>
+    <button id="claim-fees-btn">Claim Admin Fees</button>
+  </div>
+
+  <!-- EMPLOYER VIEW -->
+  <div id="employer-view" class="view" hidden>
+    <h2>Create a Stream</h2>
+    <form id="create-form">
+      <label>Employee address:
+        <input type="text" id="input-employee" placeholder="0x..." required />
+      </label>
+      <br />
+      <label>Duration (seconds):
+        <input type="number" id="input-duration" min="16" required />
+      </label>
+      <br />
+      <label>Amount (ETH):
+        <input type="text" id="input-amount" placeholder="1.0" required />
+      </label>
+      <br />
+      <button type="submit">Create Stream</button>
+    </form>
+
+    <h2>My Outgoing Streams</h2>
+    <div id="employer-streams"></div>
+  </div>
+
+  <!-- EMPLOYEE VIEW -->
+  <div id="employee-view" class="view" hidden>
+    <h2>My Incoming Streams</h2>
+    <div id="employee-streams"></div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
