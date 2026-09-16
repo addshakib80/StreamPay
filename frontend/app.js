@@ -1,11 +1,8 @@
 // ---------------------------------------------------------------
-// SETUP: paste your deployed contract address here after
-// running the deploy script (see the README, Step: Deploy).
+// SETUP: contract address and ABI
 // ---------------------------------------------------------------
-// const CONTRACT_ADDRESS = "0xYOUR_DEPLOYED_ADDRESS_HERE";
-const CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3"; // Hardhat default
+const CONTRACT_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 
-// Only the functions/events our frontend actually calls.
 const ABI = [
   "function admin() view returns (address)",
   "function adminFeeBalance() view returns (uint256)",
@@ -18,20 +15,31 @@ const ABI = [
   "function getEmployeeStreams(address employee) view returns (uint256[])"
 ];
 
-// Global state we reuse across functions.
 let provider;
 let signer;
 let contract;
 let myAddress;
 
-// Every setInterval() we start for a ticking counter is stored here
-// so we can stop them all before re-drawing the page.
-let tickers = [];
+// One card per stream ID, built once and reused. This is what stops
+// the list from ever duplicating or flickering: we only ever ADD a
+// card the first time we see a stream ID, never destroy and rebuild it.
+let employerCards = new Map(); // streamId (string) -> card element
+let employeeCards = new Map();
+
+// Only one polling loop should ever run at a time.
+let pollingIntervalId = null;
 
 // ---------------------------------------------------------------
 // Connect MetaMask
 // ---------------------------------------------------------------
 document.getElementById("connect-btn").addEventListener("click", connectWallet);
+
+// Switching accounts/networks mid-session is exactly what caused the
+// duplicate polling loops before — a full reload is the safe reset.
+if (window.ethereum) {
+  window.ethereum.on("accountsChanged", () => window.location.reload());
+  window.ethereum.on("chainChanged", () => window.location.reload());
+}
 
 async function connectWallet() {
   if (!window.ethereum) {
@@ -49,20 +57,23 @@ async function connectWallet() {
   document.getElementById("wallet-info").textContent = "Connected: " + myAddress;
   setStatus("");
 
+  const connectBtn = document.getElementById("connect-btn");
+  connectBtn.disabled = true;
+  connectBtn.textContent = "Connected";
+
   await showCorrectView();
 
-  // Simple polling loop: every 3 seconds, redraw whatever view is on
-  // screen. This is what makes cancellations/withdrawals from another
-  // browser window show up here without needing to reload the page.
-  setInterval(showCorrectView, 3000);
+  // Poll every 3 seconds so changes made from another browser window
+  // (a cancellation, a withdrawal) show up here without a reload.
+  // Guard against ever starting a second loop on top of this one.
+  if (pollingIntervalId) clearInterval(pollingIntervalId);
+  pollingIntervalId = setInterval(showCorrectView, 3000);
 }
 
 // ---------------------------------------------------------------
-// Decide which view to show (Admin, Employer, or Employee)
+// Role routing
 // ---------------------------------------------------------------
 async function showCorrectView() {
-  clearTickers(); // stop last cycle's per-second counters before redrawing
-
   const adminAddress = await contract.admin();
   const isAdmin = adminAddress.toLowerCase() === myAddress.toLowerCase();
 
@@ -74,8 +85,6 @@ async function showCorrectView() {
     return;
   }
 
-  // Any non-admin wallet can create streams (be an "employer"),
-  // and can also be an "employee" on streams other people created for them.
   document.getElementById("admin-view").hidden = true;
   document.getElementById("employer-view").hidden = false;
   await loadEmployerView();
@@ -97,7 +106,9 @@ async function loadAdminView() {
   document.getElementById("admin-fee-balance").textContent = ethers.formatEther(balance);
 }
 
-document.getElementById("claim-fees-btn").addEventListener("click", async () => {
+document.getElementById("claim-fees-btn").addEventListener("click", async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
   try {
     setStatus("Claiming fees...");
     const tx = await contract.claimAdminFees();
@@ -106,18 +117,34 @@ document.getElementById("claim-fees-btn").addEventListener("click", async () => 
     await loadAdminView();
   } catch (err) {
     setStatus(err.reason || err.message, true);
+  } finally {
+    btn.disabled = false;
   }
 });
 
 // ---------------------------------------------------------------
-// Employer view: create stream + list of outgoing streams
+// Create Stream
 // ---------------------------------------------------------------
 document.getElementById("create-form").addEventListener("submit", async (e) => {
   e.preventDefault();
 
+  const submitBtn = e.target.querySelector("button[type=submit]");
+  submitBtn.disabled = true; // blocks double-submits from creating duplicate streams
+
   const employee = document.getElementById("input-employee").value.trim();
   const duration = document.getElementById("input-duration").value.trim();
   const amount = document.getElementById("input-amount").value.trim();
+
+  if (!ethers.isAddress(employee)) {
+    setStatus("Enter a valid employee address.", true);
+    submitBtn.disabled = false;
+    return;
+  }
+  if (employee.toLowerCase() === myAddress.toLowerCase()) {
+    setStatus("You cannot create a stream paying your own address.", true);
+    submitBtn.disabled = false;
+    return;
+  }
 
   try {
     setStatus("Creating stream...");
@@ -130,84 +157,109 @@ document.getElementById("create-form").addEventListener("submit", async (e) => {
     await loadEmployerView();
   } catch (err) {
     setStatus(err.reason || err.message, true);
+  } finally {
+    submitBtn.disabled = false;
   }
 });
 
+// ---------------------------------------------------------------
+// Employer / Employee stream lists — built once, updated in place
+// ---------------------------------------------------------------
 async function loadEmployerView() {
   const streamIds = await contract.getEmployerStreams(myAddress);
-  const container = document.getElementById("employer-streams");
-  container.innerHTML = "";
-
-  for (const id of streamIds) {
-    const stream = await contract.getStream(id);
-    const card = buildStreamCard(id, stream, "employer");
-    container.appendChild(card);
-  }
+  await syncStreamList("employer-streams", employerCards, streamIds, "employer");
 }
 
-// ---------------------------------------------------------------
-// Employee view: list of incoming streams
-// ---------------------------------------------------------------
 async function loadEmployeeView() {
   const streamIds = await contract.getEmployeeStreams(myAddress);
-  const container = document.getElementById("employee-streams");
-  container.innerHTML = "";
+  await syncStreamList("employee-streams", employeeCards, streamIds, "employee");
+}
+
+async function syncStreamList(containerId, cardMap, streamIds, viewerRole) {
+  const container = document.getElementById(containerId);
 
   for (const id of streamIds) {
+    const key = id.toString();
     const stream = await contract.getStream(id);
-    const card = buildStreamCard(id, stream, "employee");
-    container.appendChild(card);
+
+    if (cardMap.has(key)) {
+      syncCardData(cardMap.get(key), stream);
+    } else {
+      const card = buildStreamCard(id, stream, viewerRole);
+      container.appendChild(card);
+      cardMap.set(key, card);
+    }
   }
 }
 
-async function withdrawFromStream(streamId) {
+// streamId + a reference to its card — the card carries a "busy" flag
+// so the per-second ticker never re-enables a button mid-transaction.
+async function withdrawFromStream(streamId, card) {
+  card._txPending = true;
+  setButtonsDisabled(card, true);
   try {
     setStatus("Withdrawing...");
     const tx = await contract.withdraw(streamId);
     await tx.wait();
     setStatus("Withdrawal complete.");
-    await loadEmployeeView();
   } catch (err) {
     setStatus(err.reason || err.message, true);
+  } finally {
+    card._txPending = false;
+    await showCorrectView(); // refreshes numbers and re-evaluates button states
   }
 }
 
-async function cancelStream(streamId) {
+async function cancelStream(streamId, card) {
+  card._txPending = true;
+  setButtonsDisabled(card, true);
   try {
     setStatus("Cancelling stream...");
     const tx = await contract.cancelStream(streamId);
     await tx.wait();
     setStatus("Stream cancelled.");
-    await loadEmployerView();
   } catch (err) {
     setStatus(err.reason || err.message, true);
+  } finally {
+    card._txPending = false;
+    await showCorrectView();
   }
 }
 
+function setButtonsDisabled(card, disabled) {
+  if (card._withdrawBtn) card._withdrawBtn.disabled = disabled;
+  if (card._cancelBtn) card._cancelBtn.disabled = disabled;
+}
+
 // ---------------------------------------------------------------
-// Build one stream card, and start its per-second ticking counter.
-// This is the "real-time" part: we read the stream's numbers ONCE,
-// then use setInterval to recompute the unlocked amount locally,
-// every second, using the exact same formula as the smart contract.
+// Building a card (once) and keeping it live
 // ---------------------------------------------------------------
 function buildStreamCard(streamId, stream, viewerRole) {
   const card = document.createElement("div");
   card.className = "stream-card";
 
-  const totalDeposit = stream.totalDeposit;     // BigInt (wei)
-  const startTime = stream.startTime;           // BigInt (seconds)
-  const duration = stream.duration;             // BigInt (seconds)
-  const endTime = stream.endTime;                // BigInt (seconds)
-  const totalWithdrawn = stream.totalWithdrawn; // BigInt (wei)
-  const isActive = stream.active;
+  // The card's own live data. The per-second ticker reads from here;
+  // syncCardData() updates these values in place on every poll — so
+  // the card never needs to be torn down and rebuilt.
+  card._state = {
+    totalDeposit: stream.totalDeposit,
+    startTime: stream.startTime,
+    duration: stream.duration,
+    endTime: stream.endTime,
+    totalWithdrawn: stream.totalWithdrawn,
+    active: stream.active
+  };
+  card._txPending = false;
+  card._withdrawBtn = null;
+  card._cancelBtn = null;
 
   const counterparty = viewerRole === "employer" ? stream.employee : stream.employer;
 
   card.innerHTML = `
-    <strong>Stream #${streamId}</strong> — ${isActive ? "active" : "closed"}<br/>
+    <strong>Stream #${streamId}</strong> — <span data-status>${stream.active ? "active" : "closed"}</span><br/>
     <span class="stream-numbers">With: ${counterparty}</span><br/>
-    <span class="stream-numbers">Total: ${ethers.formatEther(totalDeposit)} ETH,
-      Withdrawn: ${ethers.formatEther(totalWithdrawn)} ETH</span>
+    <span class="stream-numbers">Total: ${ethers.formatEther(stream.totalDeposit)} ETH,
+      Withdrawn: <span data-withdrawn>${ethers.formatEther(stream.totalWithdrawn)}</span> ETH</span>
     <progress value="0" max="100"></progress>
     <div class="stream-numbers"><span data-claimable>0</span> ETH claimable now</div>
     <div class="stream-actions"></div>
@@ -215,101 +267,110 @@ function buildStreamCard(streamId, stream, viewerRole) {
 
   const actionsDiv = card.querySelector(".stream-actions");
 
-  if (isActive && viewerRole === "employee") {
+  if (stream.active && viewerRole === "employee") {
     const withdrawBtn = document.createElement("button");
     withdrawBtn.textContent = "Withdraw Vested Funds";
-    withdrawBtn.addEventListener("click", () => withdrawFromStream(streamId));
+    withdrawBtn.addEventListener("click", () => withdrawFromStream(streamId, card));
     actionsDiv.appendChild(withdrawBtn);
+    card._withdrawBtn = withdrawBtn;
   }
 
-  if (isActive) {
+  if (stream.active) {
     const cancelBtn = document.createElement("button");
     cancelBtn.textContent = "Cancel Stream";
-    cancelBtn.addEventListener("click", () => cancelStream(streamId));
+    cancelBtn.addEventListener("click", () => cancelStream(streamId, card));
     actionsDiv.appendChild(cancelBtn);
+    card._cancelBtn = cancelBtn;
   }
 
-  if (isActive) {
-    startTicker(card, totalDeposit, startTime, duration, endTime, totalWithdrawn);
+  if (stream.active) {
+    startTicker(card);
   } else {
-    // Closed stream: just show its final state, no ticking needed.
-    card.querySelector("progress").value = 100;
-    card.querySelector("[data-claimable]").textContent = "0";
+    renderClosedCard(card);
   }
 
   return card;
 }
 
-// function startTicker(card, totalDeposit, startTime, duration, endTime, totalWithdrawn) {
-//   function updateOnce() {
-//     const now = BigInt(Math.floor(Date.now() / 1000));
-
-//     // Same formula as the smart contract's getUnlockedAmount():
-//     // Unlocked = Total * TimeElapsed / Duration (capped at Total).
-//     let unlocked;
-//     if (now >= endTime) {
-//       unlocked = totalDeposit;
-//     } else {
-//       const elapsed = now - startTime;
-//       unlocked = (totalDeposit * elapsed) / duration;
-//     }
-
-//     let claimable = unlocked - totalWithdrawn;
-//     if (claimable < 0n) claimable = 0n; // never show a negative number
-
-//     const percent = totalDeposit === 0n ? 0 : Number((unlocked * 100n) / totalDeposit);
-
-//     card.querySelector("progress").value = percent;
-//     card.querySelector("[data-claimable]").textContent = ethers.formatEther(claimable);
-
-//     if (now >= endTime) clearInterval(intervalId);
-//   }
-
-//   updateOnce(); // show the correct value immediately, don't wait 1 second
-//   const intervalId = setInterval(updateOnce, 1000);
-//   tickers.push(intervalId);
-// }
-
-
-function startTicker(card, totalDeposit, startTime, duration, endTime, totalWithdrawn) {
-  let intervalId; // declared first so updateOnce can safely reference it, even on the very first call
-
+// The real-time engine: reads card._state every second and recomputes
+// the unlocked amount locally, using the same formula as the contract.
+// Also keeps the Withdraw/Cancel buttons' enabled state in sync.
+function startTicker(card) {
   function updateOnce() {
+    const s = card._state;
+
+    if (!s.active) {
+      clearInterval(card._tickerId);
+      return;
+    }
+
     const now = BigInt(Math.floor(Date.now() / 1000));
 
     let unlocked;
-    if (now >= endTime) {
-      unlocked = totalDeposit;
+    if (now >= s.endTime) {
+      unlocked = s.totalDeposit;
     } else {
-      const elapsed = now - startTime;
-      unlocked = (totalDeposit * elapsed) / duration;
+      const elapsed = now - s.startTime;
+      unlocked = (s.totalDeposit * elapsed) / s.duration;
     }
 
-    let claimable = unlocked - totalWithdrawn;
+    let claimable = unlocked - s.totalWithdrawn;
     if (claimable < 0n) claimable = 0n;
 
-    const percent = totalDeposit === 0n ? 0 : Number((unlocked * 100n) / totalDeposit);
+    const percent = s.totalDeposit === 0n ? 0 : Number((unlocked * 100n) / s.totalDeposit);
 
     card.querySelector("progress").value = percent;
     card.querySelector("[data-claimable]").textContent = ethers.formatEther(claimable);
 
-    if (now >= endTime) clearInterval(intervalId);
+    // Don't fight with an in-flight transaction — leave buttons alone
+    // while one is pending, regardless of what claimable looks like.
+    if (!card._txPending) {
+      if (card._withdrawBtn) card._withdrawBtn.disabled = claimable <= 0n;
+
+      // Cancel stays usable the whole time there's still something it
+      // could meaningfully settle — either unvested funds to return to
+      // the employer, or vested-but-unwithdrawn funds to pay out. It
+      // only turns off once absolutely everything has been paid out.
+      if (card._cancelBtn) card._cancelBtn.disabled = s.totalWithdrawn >= s.totalDeposit;
+    }
+
+    if (now >= s.endTime) clearInterval(card._tickerId);
   }
 
-  updateOnce(); // paint immediately
-  intervalId = setInterval(updateOnce, 1000);
-  tickers.push(intervalId);
+  updateOnce();
+  card._tickerId = setInterval(updateOnce, 1000);
 }
 
-function clearTickers() {
-  for (const id of tickers) {
-    clearInterval(id);
+// Called every poll cycle for a card that already exists on screen.
+// Updates the underlying numbers only — never touches the DOM
+// structure, so there's nothing to flicker.
+function syncCardData(card, stream) {
+  const wasActive = card._state.active;
+
+  card._state.totalWithdrawn = stream.totalWithdrawn;
+  card._state.active = stream.active;
+
+  card.querySelector("[data-withdrawn]").textContent = ethers.formatEther(stream.totalWithdrawn);
+
+  if (wasActive && !stream.active) {
+    // Just got cancelled or fully paid out — from this window or
+    // another one. Freeze the card and stop its ticker.
+    renderClosedCard(card);
   }
-  tickers = [];
 }
 
-// ---------------------------------------------------------------
-// Small helper for showing status/error messages
+function renderClosedCard(card) {
+  card.querySelector("[data-status]").textContent = "closed";
+  card.querySelector("progress").value = 100;
+  card.querySelector("[data-claimable]").textContent = "0";
+  card.querySelector(".stream-actions").innerHTML = ""; // nothing more to do on a closed stream
+
+  card._withdrawBtn = null;
+  card._cancelBtn = null;
+
+  if (card._tickerId) clearInterval(card._tickerId);
+}
+
 // ---------------------------------------------------------------
 function setStatus(message, isError = false) {
   const el = document.getElementById("status");
