@@ -54,6 +54,8 @@ contract StreamPay {
     function createStream(address employee, uint256 duration) external payable {
         require(msg.value > 0, "You must send some ETH");
         require(duration > 15, "Duration must be more than 15 seconds");
+        require(employee != address(0), "Invalid employee address");
+        require(employee != msg.sender, "You cannot create a stream paying your own address");
 
         uint256 streamId = nextStreamId;
         nextStreamId = nextStreamId + 1;
@@ -119,6 +121,12 @@ contract StreamPay {
 
     // ------------------------------------------------------------
     // 4. Cancel Stream
+    // Settles unwithdrawn vested ETH to the Employee (minus the 1% fee),
+    // refunds all remaining locked (unvested) ETH back to the Employer,
+    // and marks the stream Closed. This works correctly no matter how
+    // much (if anything) the employee already withdrew earlier, because
+    // it's based on totalWithdrawn, not on how much time has passed
+    // since the last withdrawal.
     // ------------------------------------------------------------
     function cancelStream(uint256 streamId) external {
         Stream storage s = streams[streamId];
